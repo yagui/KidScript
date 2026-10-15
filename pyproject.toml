@@ -1,0 +1,16 @@
+[project]
+name = "KidScript"
+version = "0.1.0"
+description = "OCR for children handwritten stories"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "causal-conv1d>=1.7.0",
+    "flash-linear-attention[cuda]>=0.5.2",
+    "pdf2image>=1.17.0",
+    "peft>=0.20.0",
+    "pillow>=12.3.0",
+    "torch>=2.13.0",
+    "transformers>=5.12.1",
+]
