@@ -6,13 +6,13 @@ Relative image paths are resolved from the manifest file's directory.
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image
 from peft import PeftModel
+from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
     AutoModelForImageTextToText,
@@ -41,9 +41,7 @@ class OCRPairs(Dataset):
         for line_number, record in enumerate(manifest_data, start=1):
             if not isinstance(record, dict):
                 raise TypeError(f"{self.manifest}: example {line_number} must be an object")
-            if not isinstance(record.get("image"), str) or not isinstance(
-                record.get("text"), str
-            ):
+            if not isinstance(record.get("image"), str) or not isinstance(record.get("text"), str):
                 raise TypeError(
                     f"{self.manifest}:{line_number}: expected string fields 'image' and 'text'"
                 )
@@ -99,9 +97,7 @@ class OCRPairs(Dataset):
         )
 
         prompt_length = prompt["input_ids"].shape[1]
-        if not torch.equal(
-            prompt["input_ids"][0], encoded["input_ids"][0, :prompt_length]
-        ):
+        if not torch.equal(prompt["input_ids"][0], encoded["input_ids"][0, :prompt_length]):
             raise ValueError(
                 "Prompt tokens are not a prefix of the full conversation; "
                 "cannot safely mask the transcription labels."
@@ -129,9 +125,13 @@ def main() -> None:
     parser.add_argument("--validation-data", type=Path, help="Optional validation JSON manifest")
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
     parser.add_argument("--adapter", default=DEFAULT_ADAPTER, help="Starting OCR LoRA adapter")
-    parser.add_argument("--output-dir", type=Path, default=Path("qwen3.5-handwritten-spanish-adapter"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("qwen3.5-handwritten-spanish-adapter")
+    )
     parser.add_argument("--epochs", type=float, default=3)
-    parser.add_argument("--max-steps", type=int, default=-1, help="Set to 1 for a training smoke test")
+    parser.add_argument(
+        "--max-steps", type=int, default=-1, help="Set to 1 for a training smoke test"
+    )
     parser.add_argument("--max-image-pixels", type=int, default=100352)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -151,9 +151,7 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(args.base_model)
     processor.image_processor.size.longest_edge = args.max_image_pixels
     train_dataset = OCRPairs(args.train_data, processor)
-    validation_dataset = (
-        OCRPairs(args.validation_data, processor) if args.validation_data else None
-    )
+    validation_dataset = OCRPairs(args.validation_data, processor) if args.validation_data else None
 
     use_cuda = torch.cuda.is_available()
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()

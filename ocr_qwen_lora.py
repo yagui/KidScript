@@ -3,8 +3,8 @@
 import argparse
 import sys
 
-import torch
 import numpy as np
+import torch
 from pdf2image import convert_from_path
 from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -15,9 +15,7 @@ ADAPTER = "qwen3.5-handwritten-spanish-adapter-v2"
 PROMPT = "Transcribe the text in this image exactly. Do not add, correct, or infer text."
 
 
-def detect_text_regions(
-    image, background_threshold=200, padding=24, gap=45, min_width_ratio=0.25
-):
+def detect_text_regions(image, background_threshold=200, padding=24, gap=45, min_width_ratio=0.25):
     """Find horizontal handwriting bands using the page's dark-pixel projection."""
     gray = np.asarray(image.convert("L"))
     ink = gray < background_threshold
@@ -67,9 +65,7 @@ def load_model(adapter=ADAPTER, max_image_pixels=100352):
 
     processor = AutoProcessor.from_pretrained(BASE_MODEL)
     processor.image_processor.size.longest_edge = max_image_pixels  # same cap as training
-    model = AutoModelForImageTextToText.from_pretrained(
-        BASE_MODEL, dtype=dtype, device_map=device
-    )
+    model = AutoModelForImageTextToText.from_pretrained(BASE_MODEL, dtype=dtype, device_map=device)
     model = PeftModel.from_pretrained(model, adapter)
     model.eval()
     return model, processor, device
@@ -110,11 +106,15 @@ def ocr_image(model, processor, device, image, max_new_tokens=256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", nargs="?", default="1a.pdf", help="Path to the input PDF")
-    parser.add_argument("-o", "--output", default="output.txt", help="Path to write the transcription")
+    parser.add_argument(
+        "-o", "--output", default="output.txt", help="Path to write the transcription"
+    )
     parser.add_argument("--dpi", type=int, default=300, help="Rendering DPI for PDF pages")
     parser.add_argument("--save-crops", help="Directory where detected text crops are saved")
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--adapter", default=ADAPTER, help="LoRA adapter directory or Hugging Face id")
+    parser.add_argument(
+        "--adapter", default=ADAPTER, help="LoRA adapter directory or Hugging Face id"
+    )
     parser.add_argument("--max-image-pixels", type=int, default=100352)
     args = parser.parse_args()
 
