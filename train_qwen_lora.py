@@ -1,19 +1,20 @@
-"""Fine-tune a Qwen3.5 vision-language model with image/transcription pairs.
-
-Each JSON record must contain an image path and its exact target transcription.
-Relative image paths are resolved from the manifest file's directory.
-"""
+"""Fine-tune Qwen3.5 with line, paragraph, and PDF transcription examples."""
 
 import argparse
 import json
+import math
+import random
+import re
 import sys
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import torch
+from pdf2image import convert_from_path, pdfinfo_from_path
 from peft import PeftModel
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
@@ -24,52 +25,229 @@ from transformers import (
 DEFAULT_BASE_MODEL = "unsloth/Qwen3.5-0.8B"
 DEFAULT_ADAPTER = "Ak137/qwen3.5-0.8B-handwritten-spanish-ocr-lora"
 PROMPT = "Transcribe the text in this image exactly. Do not add, correct, or infer text."
+PARAGRAPH_PATTERN = re.compile(r"para(?:graph|ghrap)_(\d+)$", re.IGNORECASE)
+
+
+def natural_key(path: Path) -> list[int | str]:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+
+
+def paragraph_groups(
+    line_images: list[Path], paragraph_images: list[Path]
+) -> list[tuple[int, int]]:
+    """Split numbered crops into contiguous groups matching paragraph aspect ratios."""
+    if not line_images:
+        return []
+    if not paragraph_images:
+        return []
+    if len(paragraph_images) == 1:
+        return [(0, len(line_images))]
+    if len(paragraph_images) > len(line_images):
+        raise ValueError(
+            f"Cannot assign {len(line_images)} line crops to {len(paragraph_images)} paragraphs"
+        )
+
+    dimensions = []
+    for image_path in line_images:
+        with Image.open(image_path) as image:
+            dimensions.append(image.size)
+    paragraph_dimensions = []
+    for image_path in paragraph_images:
+        with Image.open(image_path) as image:
+            paragraph_dimensions.append(image.size)
+
+    best_score = math.inf
+    best_groups: list[tuple[int, int]] = []
+    for cuts in combinations(range(1, len(line_images)), len(paragraph_images) - 1):
+        boundaries = (0, *cuts, len(line_images))
+        groups = list(zip(boundaries[:-1], boundaries[1:], strict=True))
+        score = 0.0
+        for (start, end), (paragraph_width, paragraph_height) in zip(
+            groups, paragraph_dimensions, strict=True
+        ):
+            group = dimensions[start:end]
+            combined_width = max(width for width, _ in group)
+            combined_height = sum(height for _, height in group)
+            expected_ratio = combined_width / combined_height
+            actual_ratio = paragraph_width / paragraph_height
+            score += abs(math.log(actual_ratio / expected_ratio))
+        if score < best_score:
+            best_score = score
+            best_groups = groups
+    return best_groups
+
+
+def split_dataset(
+    dataset: "OCRPairs", validation_fraction: float, seed: int
+) -> tuple[Subset, Subset]:
+    """Split whole PDF/crop folders so related images cannot leak across sets."""
+    groups: dict[str, list[int]] = {}
+    for index, record in enumerate(dataset.records):
+        if "pdf" in record:
+            pdf_path = Path(record["pdf"]).resolve()
+            group_path = pdf_path.parent / pdf_path.stem
+        else:
+            image_dir = Path(record["image"]).resolve().parent
+            if image_dir.name.startswith("crops_"):
+                group_path = image_dir.parent / image_dir.name.removeprefix("crops_")
+            else:
+                group_path = image_dir
+        group = str(group_path)
+        groups.setdefault(group, []).append(index)
+
+    group_names = list(groups)
+    if len(group_names) < 2:
+        raise ValueError("A 70/30 split requires at least two document groups")
+    random.Random(seed).shuffle(group_names)
+
+    validation_group_count = round(len(group_names) * validation_fraction)
+    validation_group_count = min(max(validation_group_count, 1), len(group_names) - 1)
+    validation_groups = set(group_names[:validation_group_count])
+    train_indices = [
+        index
+        for group, indices in groups.items()
+        if group not in validation_groups
+        for index in indices
+    ]
+    validation_indices = [
+        index
+        for group, indices in groups.items()
+        if group in validation_groups
+        for index in indices
+    ]
+    return Subset(dataset, train_indices), Subset(dataset, validation_indices)
 
 
 class OCRPairs(Dataset):
-    def __init__(self, manifest: Path, processor: Any):
-        self.manifest = manifest.resolve()
+    def __init__(self, data_path: Path, processor: Any, pdf_dpi: int = 200):
+        self.data_path = data_path.resolve()
         self.processor = processor
-        self.records: list[dict[str, str]] = []
+        self.pdf_dpi = pdf_dpi
+        self.records: list[dict[str, Any]] = []
 
-        manifest_data = json.loads(self.manifest.read_text(encoding="utf-8"))
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"Training data not found: {self.data_path}")
+        if self.data_path.suffix.lower() == ".pdf":
+            self._add_document(self.data_path)
+        elif self.data_path.is_file():
+            self.records.extend(self._read_manifest(self.data_path))
+        else:
+            manifests = sorted(self.data_path.rglob("transcriptions.json"), key=natural_key)
+            pdfs = sorted(self.data_path.rglob("*.pdf"), key=natural_key)
+            if pdfs:
+                for pdf_path in pdfs:
+                    self._add_document(pdf_path)
+            else:
+                for manifest in manifests:
+                    self.records.extend(self._read_manifest(manifest))
+                for image_path, text in self._paragraph_examples(manifests):
+                    self.records.append({"image": str(image_path), "text": text})
+
+        if not self.records:
+            raise ValueError(f"No training examples found in {self.data_path}")
+
+    def _read_manifest(self, manifest: Path) -> list[dict[str, str]]:
+        manifest = manifest.resolve()
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
         if isinstance(manifest_data, dict):
             manifest_data = manifest_data.get("examples")
         if not isinstance(manifest_data, list):
-            raise TypeError(f"{self.manifest}: expected a JSON array of examples")
+            raise TypeError(f"{manifest}: expected a JSON array of examples")
 
+        records: list[dict[str, str]] = []
         for line_number, record in enumerate(manifest_data, start=1):
             if not isinstance(record, dict):
-                raise TypeError(f"{self.manifest}: example {line_number} must be an object")
+                raise TypeError(f"{manifest}: example {line_number} must be an object")
             if not isinstance(record.get("image"), str) or not isinstance(record.get("text"), str):
                 raise TypeError(
-                    f"{self.manifest}:{line_number}: expected string fields 'image' and 'text'"
+                    f"{manifest}:{line_number}: expected string fields 'image' and 'text'"
                 )
             if not record["text"].strip():
                 print(
-                    f"Skipping example {line_number} with an empty transcription",
+                    f"Skipping {manifest} example {line_number} with an empty transcription",
                     file=sys.stderr,
                 )
                 continue
             image_path = Path(record["image"])
             if not image_path.is_absolute():
-                image_path = self.manifest.parent / image_path
+                image_path = manifest.parent / image_path
             if not image_path.is_file():
-                raise FileNotFoundError(
-                    f"{self.manifest}:{line_number}: image not found: {image_path}"
-                )
-            self.records.append({"image": str(image_path), "text": record["text"]})
+                raise FileNotFoundError(f"{manifest}:{line_number}: image not found: {image_path}")
+            records.append({"image": str(image_path), "text": record["text"]})
+        return records
 
-        if not self.records:
-            raise ValueError(f"No training examples found in {self.manifest}")
+    def _paragraph_images(self, crop_dir: Path) -> list[Path]:
+        numbered_images: list[tuple[int, Path]] = []
+        for path in crop_dir.glob("*.png"):
+            match = PARAGRAPH_PATTERN.fullmatch(path.stem)
+            if match:
+                numbered_images.append((int(match.group(1)), path))
+        return [path for _, path in sorted(numbered_images)]
+
+    def _paragraph_examples(self, manifests: list[Path]) -> list[tuple[Path, str]]:
+        examples: list[tuple[Path, str]] = []
+        for manifest in manifests:
+            records = self._read_manifest(manifest)
+            numbered = [record for record in records if Path(record["image"]).stem.isdigit()]
+            numbered.sort(key=lambda record: int(Path(record["image"]).stem))
+            images = self._paragraph_images(manifest.parent)
+            line_images = [Path(record["image"]) for record in numbered]
+            for image_path, (start, end) in zip(
+                images, paragraph_groups(line_images, images), strict=True
+            ):
+                text = "\n".join(record["text"] for record in numbered[start:end])
+                if text.strip():
+                    examples.append((image_path, text))
+        return examples
+
+    def _add_document(self, pdf_path: Path) -> None:
+        crop_dir = pdf_path.with_name(f"crops_{pdf_path.stem}")
+        manifest = crop_dir / "transcriptions.json"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"Missing transcription manifest for {pdf_path}: {manifest}")
+
+        records = self._read_manifest(manifest)
+        self.records.extend(records)
+        numbered = [record for record in records if Path(record["image"]).stem.isdigit()]
+        numbered.sort(key=lambda record: int(Path(record["image"]).stem))
+        if not numbered:
+            raise ValueError(f"{manifest}: no numbered crop transcriptions found")
+
+        paragraph_images = self._paragraph_images(crop_dir)
+        groups = paragraph_groups([Path(record["image"]) for record in numbered], paragraph_images)
+        paragraph_texts: list[str] = []
+        explicit_images = {Path(record["image"]).resolve() for record in records}
+        for paragraph_image, (start, end) in zip(paragraph_images, groups, strict=True):
+            text = "\n".join(record["text"] for record in numbered[start:end])
+            paragraph_texts.append(text)
+            if paragraph_image.resolve() not in explicit_images:
+                self.records.append({"image": str(paragraph_image), "text": text})
+
+        if not paragraph_texts:
+            paragraph_texts = ["\n".join(record["text"] for record in numbered)]
+        full_text = "\n\n".join(paragraph_texts)
+        info = pdfinfo_from_path(str(pdf_path))
+        for page_number in range(1, int(info["Pages"]) + 1):
+            self.records.append({"pdf": str(pdf_path), "page": page_number, "text": full_text})
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = self.records[index]
-        with Image.open(record["image"]) as source:
-            image = source.convert("RGB")
+        if "pdf" in record:
+            pages = convert_from_path(
+                record["pdf"],
+                dpi=self.pdf_dpi,
+                first_page=record["page"],
+                last_page=record["page"],
+            )
+            if len(pages) != 1:
+                raise RuntimeError(f"Failed to render {record['pdf']} page {record['page']}")
+            image = pages[0].convert("RGB")
+        else:
+            with Image.open(record["image"]) as source:
+                image = source.convert("RGB")
 
         user_message = {
             "role": "user",
@@ -119,10 +297,19 @@ def main() -> None:
     parser.add_argument(
         "--train-data",
         type=Path,
-        default=Path("crops/transcriptions.json"),
-        help="Training JSON manifest (default: crops/transcriptions.json)",
+        default=Path("training_set/"),
+        help="Training directory, PDF, or JSON manifest (default: training_set/)",
     )
-    parser.add_argument("--validation-data", type=Path, help="Optional validation JSON manifest")
+    parser.add_argument(
+        "--validation-data", type=Path, help="Optional validation directory, PDF, or JSON"
+    )
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.3,
+        help="Fraction reserved for validation when --validation-data is omitted",
+    )
+    parser.add_argument("--pdf-dpi", type=int, default=200, help="DPI for PDF training pages")
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
     parser.add_argument("--adapter", default=DEFAULT_ADAPTER, help="Starting OCR LoRA adapter")
     parser.add_argument(
@@ -147,11 +334,31 @@ def main() -> None:
         parser.error("--max-steps must be -1 (unlimited) or a positive integer")
     if args.max_image_pixels < 1:
         parser.error("--max-image-pixels must be positive")
+    if args.pdf_dpi < 1:
+        parser.error("--pdf-dpi must be positive")
+    if not 0 < args.validation_fraction < 1:
+        parser.error("--validation-fraction must be greater than 0 and less than 1")
 
     processor = AutoProcessor.from_pretrained(args.base_model)
     processor.image_processor.size.longest_edge = args.max_image_pixels
-    train_dataset = OCRPairs(args.train_data, processor)
-    validation_dataset = OCRPairs(args.validation_data, processor) if args.validation_data else None
+    all_examples = OCRPairs(args.train_data, processor, args.pdf_dpi)
+    if args.validation_data:
+        train_dataset: Dataset = all_examples
+        validation_dataset: Dataset = OCRPairs(args.validation_data, processor, args.pdf_dpi)
+    else:
+        train_dataset, validation_dataset = split_dataset(
+            all_examples, args.validation_fraction, args.seed
+        )
+        print(
+            f"Validation fraction: {len(validation_dataset) / len(all_examples):.1%} "
+            f"({len(validation_dataset)}/{len(all_examples)} examples)",
+            file=sys.stderr,
+        )
+    print(
+        f"Loaded {len(train_dataset)} training examples"
+        f" and {len(validation_dataset)} validation examples",
+        file=sys.stderr,
+    )
 
     use_cuda = torch.cuda.is_available()
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()

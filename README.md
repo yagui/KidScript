@@ -57,7 +57,19 @@ El prompt de inferencia debe coincidir con el usado en el entrenamiento.
 
 Continúa entrenando un adaptador LoRA existente (por defecto el de Ak137) con tus correcciones y guarda el resultado en otra carpeta, sin modificar el original.
 
-1. Completá el campo `text` de cada entrada en `crops/transcriptions.json`:
+1. Organizá cada documento como un PDF y una carpeta asociada:
+
+   ```text
+   training_set/
+   ├── 01.pdf
+   └── crops_01/
+       ├── 1.png
+       ├── 2.png
+       ├── paragraph_01.png
+       └── transcriptions.json
+   ```
+
+2. Completá el campo `text` de cada recorte numerado en `transcriptions.json`:
 
    ```json
    [
@@ -67,15 +79,29 @@ Continúa entrenando un adaptador LoRA existente (por defecto el de Ak137) con t
 
    Las rutas son relativas al JSON. Las entradas con `text` vacío se omiten.
 
-2. Ejecutá el entrenamiento:
+   Si hay varias imágenes `paragraph_NN.png`, el script agrupa los recortes contiguos
+   visualmente, comparando las proporciones de los grupos con cada párrafo.
+
+3. Ejecutá el entrenamiento:
 
    ```bash
    uv run train_qwen_lora.py --output-dir qwen3.5-handwritten-spanish-adapter-v2
    ```
 
+   El conjunto incluye cada recorte numerado, cada imagen de párrafo y cada página
+   renderizada desde el PDF. Por defecto, las carpetas completas de cada documento
+   se reparten aproximadamente 70/30 entre entrenamiento y validación, evitando que
+   recortes de un mismo PDF aparezcan en ambos conjuntos. El conjunto de entrenamiento
+   se mezcla en cada época con una semilla reproducible.
+
 Opciones útiles:
 
-- `--train-data` / `--validation-data`: manifiestos JSON de entrenamiento y validación.
+- `--train-data` / `--validation-data`: directorio, PDF o manifiesto JSON.
+- `--validation-fraction`: proporción de validación al no indicar `--validation-data`
+  (30% por defecto).
+- `--pdf-dpi`: resolución usada al renderizar páginas del PDF durante el entrenamiento
+  (200 DPI por defecto).
+- `--seed`: semilla usada para la división y el orden aleatorio de las épocas.
 - `--adapter`: adaptador de partida.
 - `--epochs`, `--learning-rate`, `--gradient-accumulation-steps`: hiperparámetros.
 - `--max-steps 1`: prueba rápida para verificar que el entrenamiento corre.
